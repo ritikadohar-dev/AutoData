@@ -32,6 +32,7 @@ st.markdown("""
 
 st.markdown('<div class="main-title">AutoData: Interactive EDA & Diagnostic Suite</div>', unsafe_allow_html=True)
 st.markdown('<div class="sub-title">Automated Statistical Profiling, Health Assessment, and Remediation Framework for Tabular Datasets</div>', unsafe_allow_html=True)
+
 # ----------------- Helper Functions ----------------- #
 
 def load_data(uploaded_file):
@@ -65,6 +66,7 @@ def detect_outliers_iqr(series):
 def convert_df_to_csv(df):
     """Converts the processed DataFrame into a downloadable CSV format."""
     return df.to_csv(index=False).encode('utf-8')
+
 # ----------------- Sidebar File Ingestion ----------------- #
 
 st.sidebar.header("📁 Ingestion Interface")
@@ -98,6 +100,7 @@ if uploaded_file is not None:
         "🛠️ Remediation & Imputation", 
         "💾 Export Data"
     ])
+
     # ----------------- TAB 1: Structural Health Profiling ----------------- #
     with tab1:
         st.subheader("1. Structural Health & Dataset Profile")
@@ -135,7 +138,8 @@ if uploaded_file is not None:
         if num_cols:
             st.markdown("**Descriptive Statistics (Numerical Columns)**")
             st.dataframe(df.describe().T.round(3), width="stretch")
-# ----------------- TAB 2: Distribution & Outlier Mapping ----------------- #
+
+    # ----------------- TAB 2: Distribution & Outlier Mapping ----------------- #
     with tab2:
         st.subheader("2. Distribution & Tukey's Outlier Mapping")
         
@@ -168,7 +172,8 @@ if uploaded_file is not None:
 
                 st.pyplot(fig)
                 plt.close(fig)
-# ----------------- TAB 3: Pearson Correlation ----------------- #
+
+    # ----------------- TAB 3: Pearson Correlation ----------------- #
     with tab3:
         st.subheader("3. Multivariate Pearson Correlation Assessment")
         
@@ -212,7 +217,8 @@ if uploaded_file is not None:
                 st.dataframe(pd.DataFrame(redundancy_list), width="stretch")
             else:
                 st.success("No feature pairs with high multicollinearity (|r| > 0.85) detected.")
-# ----------------- TAB 4: Remediation Pipeline ----------------- #
+
+    # ----------------- TAB 4: Remediation Pipeline ----------------- #
     with tab4:
         st.subheader("4. Parameterized Data Cleaning & Remediation")
         
@@ -238,7 +244,8 @@ if uploaded_file is not None:
                 st.success("No missing values remaining in the working dataset.")
             else:
                 target_col = st.selectbox("Select Column to Impute", cols_with_na)
-                is_numeric = np.issubdtype(df[target_col].dtype, np.number)
+                # Fix: using pd.api.types.is_numeric_dtype instead of np.issubdtype
+                is_numeric = pd.api.types.is_numeric_dtype(df[target_col])
                 
                 if is_numeric:
                     strategy = st.selectbox("Imputation Strategy", ["Median", "Mean", "Custom Constant", "Drop Rows with NA"])
@@ -270,7 +277,8 @@ if uploaded_file is not None:
                     st.session_state.working_df = df
                     st.success(f"Remediation policy '{strategy}' applied to column '{target_col}'.")
                     st.rerun()
-# ----------------- TAB 5: Export Remediated Dataset ----------------- #
+
+    # ----------------- TAB 5: Export Remediated Dataset ----------------- #
     with tab5:
         st.subheader("5. Export Remediated Dataset")
         st.write("Download the updated, remediated dataset ready for downstream machine learning tasks.")
@@ -278,7 +286,7 @@ if uploaded_file is not None:
         
         csv_data = convert_df_to_csv(df)
         st.download_button(
-            label=" Download Cleaned CSV",
+            label="📥 Download Cleaned CSV",
             data=csv_data,
             file_name=f"autodata_cleaned_{uploaded_file.name.split('.')[0]}.csv",
             mime="text/csv",
@@ -286,4 +294,4 @@ if uploaded_file is not None:
         )
 
 else:
-    st.info(" Upload a CSV or Excel file via the left sidebar to initiate automated exploratory profiling.")
+    st.info("👋 Upload a CSV or Excel file via the left sidebar to initiate automated exploratory profiling.")
