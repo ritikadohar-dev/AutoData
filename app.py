@@ -67,6 +67,64 @@ def convert_df_to_csv(df):
     """Converts the processed DataFrame into a downloadable CSV format."""
     return df.to_csv(index=False).encode('utf-8')
 
+def auto_clean_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """Automatically standardizes placeholders, parses numeric text, clips IQR outliers, and imputes missing values."""
+    df = df.copy()
+    report = {}
+
+    # 1. Replace string placeholders with NaN & drop exact duplicates
+    df = df.replace(["?", "N/A", "null", "unknown", "TBD", "invalid_date", ""], np.nan)
+    initial_rows = len(df)
+    df = df.drop_duplicates().reset_index(drop=True)
+    if initial_rows - len(df) > 0:
+        report["Duplicate Rows"] = f"Removed {initial_rows - len(df)} duplicate records"
+
+    # 2. Auto-convert numeric-looking text columns (e.g., "$65,721.54")
+    for col in df.select_dtypes(include=["object", "string"]).columns:
+        cleaned_str = df[col].astype(str).str.replace(r"[$,]", "", regex=True).str.strip()
+        converted = pd.to_numeric(cleaned_str, errors="coerce")
+        if converted.notna().mean() > 0.7:
+            df[col] = converted
+            report[col] = "Converted currency/string to Numeric"
+
+    # 3. Choose automated cleaning strategy per column
+    for col in df.columns:
+        if pd.api.types.is_string_dtype(df[col]) or df[col].dtype == "object" or df[col].dtype == "bool":
+            df[col] = df[col].astype(str).str.strip()
+            df.loc[df[col].isin(["nan", "None", "<NA>"]), col] = np.nan
+            if df[col].isna().any() and not df[col].mode().empty:
+                fill_val = df[col].mode()[0]
+                df[col] = df[col].fillna(fill_val)
+                report[col] = f"Imputed with Mode ('{fill_val}')"
+
+        elif pd.api.types.is_numeric_dtype(df[col]):
+            # Mode for binary / low-cardinality columns
+            if df[col].nunique(dropna=True) <= 5:
+                if df[col].isna().any() and not df[col].mode().empty:
+                    fill_val = df[col].mode()[0]
+                    df[col] = df[col].fillna(fill_val)
+                    report[col] = f"Imputed with Mode ({fill_val})"
+            else:
+                # Continuous columns: clip outliers via Tukey's 1.5*IQR fences
+                q1, q3 = df[col].quantile(0.25), df[col].quantile(0.75)
+                iqr = q3 - q1
+                lower_fence, upper_fence = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+                outliers_count = ((df[col] < lower_fence) | (df[col] > upper_fence)).sum()
+                df[col] = df[col].clip(lower=lower_fence, upper=upper_fence)
+
+                # Skewness-adaptive imputation (Median if |skew| > 0.5 else Mean)
+                skew = abs(df[col].skew())
+                has_na = df[col].isna().any()
+                if has_na:
+                    fill_val = df[col].median() if skew > 0.5 else df[col].mean()
+                    method = "Median" if skew > 0.5 else "Mean"
+                    df[col] = df[col].fillna(fill_val)
+                    report[col] = f"Clipped {outliers_count} outliers & imputed missing with {method} ({fill_val:.2f})"
+                elif outliers_count > 0:
+                    report[col] = f"Clipped {outliers_count} outliers via IQR fences"
+
+    return df, report
+
 # ----------------- Sidebar File Ingestion ----------------- #
 
 st.sidebar.header("📁 Ingestion Interface")
@@ -84,12 +142,14 @@ if uploaded_file is not None:
             st.session_state.raw_df = df.copy()
             st.session_state.working_df = df.copy()
             st.session_state.file_name = uploaded_file.name
+            st.session_state.pop("auto_clean_report", None)
 
     df = st.session_state.working_df
 
     # Reset Data Button
     if st.sidebar.button("🔄 Reset to Original Data"):
         st.session_state.working_df = st.session_state.raw_df.copy()
+        st.session_state.pop("auto_clean_report", None)
         st.rerun()
 
     # Module Tabs
@@ -138,7 +198,6 @@ if uploaded_file is not None:
         if num_cols:
             st.markdown("**Descriptive Statistics (Numerical Columns)**")
             st.dataframe(df.describe().T.round(3), width="stretch")
-
     # ----------------- TAB 2: Distribution & Outlier Mapping ----------------- #
     with tab2:
         st.subheader("2. Distribution & Tukey's Outlier Mapping")
@@ -218,15 +277,35 @@ if uploaded_file is not None:
             else:
                 st.success("No feature pairs with high multicollinearity (|r| > 0.85) detected.")
 
-    # ----------------- TAB 4: Remediation Pipeline ----------------- #
+# ----------------- TAB 4: Remediation Pipeline ----------------- #
     with tab4:
         st.subheader("4. Parameterized Data Cleaning & Remediation")
+
+        # 1-Click Automated Remediation Engine
+        st.markdown("#### ⚡ 1-Click Automated Cleaning Pipeline")
+        st.write("Automatically standardizes placeholders (`?`, `N/A`, `TBD`), parses currency strings (`$`, `,`), clips IQR outliers, and applies skewness-adaptive imputation.")
         
+        if st.button("🚀 Run Full Auto-Clean", type="primary"):
+            cleaned_df, audit_report = auto_clean_dataframe(df)
+            st.session_state.working_df = cleaned_df
+            st.session_state.auto_clean_report = audit_report
+            st.rerun()
+
+        if "auto_clean_report" in st.session_state and st.session_state.auto_clean_report:
+            st.success("Automated remediation completed! Audit Summary:")
+            audit_df = pd.DataFrame(
+                list(st.session_state.auto_clean_report.items()),
+                columns=["Target / Feature", "Applied Remediation Policy"]
+            )
+            st.dataframe(audit_df, width="stretch")
+
+        st.markdown("---")
+        st.markdown("#### 🔧 Manual Granular Controls")
         col_rem1, col_rem2 = st.columns(2)
         
         # Deduplication Module
         with col_rem1:
-            st.markdown("#### Duplicate Row Elimination")
+            st.markdown("**Duplicate Row Elimination**")
             st.write(f"Current duplicate instances detected: **{df.duplicated().sum()}**")
             if st.button("Drop Duplicate Records"):
                 initial_len = len(df)
@@ -237,14 +316,13 @@ if uploaded_file is not None:
 
         # Missing Value Imputation Module
         with col_rem2:
-            st.markdown("#### Missing Value Imputation")
+            st.markdown("**Missing Value Imputation**")
             cols_with_na = df.columns[df.isna().any()].tolist()
             
             if not cols_with_na:
                 st.success("No missing values remaining in the working dataset.")
             else:
                 target_col = st.selectbox("Select Column to Impute", cols_with_na)
-                # Fix: using pd.api.types.is_numeric_dtype instead of np.issubdtype
                 is_numeric = pd.api.types.is_numeric_dtype(df[target_col])
                 
                 if is_numeric:
