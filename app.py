@@ -66,137 +66,63 @@ def detect_outliers_iqr(series):
 def convert_df_to_csv(df):
     """Converts the processed DataFrame into a downloadable CSV format."""
     return df.to_csv(index=False).encode('utf-8')
+def auto_clean_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """Automatically standardizes placeholders, parses numeric text, clips IQR outliers, and imputes missing values."""
+    df = df.copy()
+    report = {}
 
-def auto_clean_dataframe(
-    df: pd.DataFrame, current_year: int = 2026
-) -> tuple[pd.DataFrame, list[str]]:
-  df = df.copy()
-  audit_report = []
-
-  # 1. Remove exact duplicates
-  dup_count = int(df.duplicated().sum())
-  if dup_count > 0:
+    # 1. Replace string placeholders with NaN & drop exact duplicates
+    df = df.replace(["?", "N/A", "null", "unknown", "TBD", "invalid_date", ""], np.nan)
+    initial_rows = len(df)
     df = df.drop_duplicates().reset_index(drop=True)
-    audit_report.append(f'Removed {dup_count} exact duplicate rows.')
+    if initial_rows - len(df) > 0:
+        report["Duplicate Rows"] = f"Removed {initial_rows - len(df)} duplicate records"
 
-  # 2. Convert placeholder symbols to NaN & trim whitespace
-  placeholders = {'?', 'NA', 'N/A', 'null', 'None', 'nan', '-', ''}
-  for col in df.select_dtypes(include=['object', 'string']).columns:
-    before_nulls = df[col].isnull().sum()
-    df[col] = df[col].apply(
-        lambda x: np.nan if (isinstance(x, str) and x.strip() in placeholders) else x
-    )
-    replaced = int(df[col].isnull().sum() - before_nulls)
-    if replaced > 0:
-      audit_report.append(
-          f"Converted {replaced} placeholder symbols to NaN in '{col}'."
-      )
+    # 2. Auto-convert numeric-looking text columns (e.g., "$65,721.54")
+    for col in df.select_dtypes(include=["object", "string"]).columns:
+        cleaned_str = df[col].astype(str).str.replace(r"[$,]", "", regex=True).str.strip()
+        converted = pd.to_numeric(cleaned_str, errors="coerce")
+        if converted.notna().mean() > 0.7:
+            df[col] = converted
+            report[col] = "Converted currency/string to Numeric"
 
-    if not col.lower().endswith('_id') and col.lower() != 'id':
-      df[col] = df[col].apply(lambda x: x.strip() if isinstance(x, str) else x)
+    # 3. Choose automated cleaning strategy per column
+    for col in df.columns:
+        if pd.api.types.is_string_dtype(df[col]) or df[col].dtype == "object" or df[col].dtype == "bool":
+            df[col] = df[col].astype(str).str.strip()
+            df.loc[df[col].isin(["nan", "None", "<NA>"]), col] = np.nan
+            if df[col].isna().any() and not df[col].mode().empty:
+                fill_val = df[col].mode()[0]
+                df[col] = df[col].fillna(fill_val)
+                report[col] = f"Imputed with Mode ('{fill_val}')"
 
-  # 3. Standardize booleans (Yes/No) and text casing/aliases
-  aliases = {'hyd': 'Hyderabad', 'new delhi': 'Delhi', 'bangalore': 'Bengaluru'}
-  bool_map = {
-      'yes': 'Yes',
-      'true': 'Yes',
-      '1': 'Yes',
-      'no': 'No',
-      'false': 'No',
-      '0': 'No',
-  }
+        elif pd.api.types.is_numeric_dtype(df[col]):
+            # Mode for binary / low-cardinality columns
+            if df[col].nunique(dropna=True) <= 5:
+                if df[col].isna().any() and not df[col].mode().empty:
+                    fill_val = df[col].mode()[0]
+                    df[col] = df[col].fillna(fill_val)
+                    report[col] = f"Imputed with Mode ({fill_val})"
+            else:
+                # Continuous columns: clip outliers via Tukey's 1.5*IQR fences
+                q1, q3 = df[col].quantile(0.25), df[col].quantile(0.75)
+                iqr = q3 - q1
+                lower_fence, upper_fence = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+                outliers_count = ((df[col] < lower_fence) | (df[col] > upper_fence)).sum()
+                df[col] = df[col].clip(lower=lower_fence, upper=upper_fence)
 
-  for col in df.select_dtypes(include=['object', 'string']).columns:
-    if col.lower().endswith('_id') or col.lower() == 'id':
-      continue
-    non_null_lower = df[col].dropna().astype(str).str.lower().unique()
-    if len(non_null_lower) > 0 and set(non_null_lower).issubset(
-        set(bool_map.keys())
-    ):
-      df[col] = df[col].apply(
-          lambda x: bool_map[str(x).lower()] if pd.notna(x) else x
-      )
-      audit_report.append(
-          f"Standardized boolean values to 'Yes'/'No' in '{col}'."
-      )
-    else:
-      df[col] = df[col].apply(
-          lambda x: aliases.get(x.lower(), x.title()) if isinstance(x, str) else x
-      )
-      audit_report.append(
-          f"Standardized text casing and aliases in '{col}'."
-      )
+                # Skewness-adaptive imputation (Median if |skew| > 0.5 else Mean)
+                skew = abs(df[col].skew())
+                has_na = df[col].isna().any()
+                if has_na:
+                    fill_val = df[col].median() if skew > 0.5 else df[col].mean()
+                    method = "Median" if skew > 0.5 else "Mean"
+                    df[col] = df[col].fillna(fill_val)
+                    report[col] = f"Clipped {outliers_count} outliers & imputed missing with {method} ({fill_val:.2f})"
+                elif outliers_count > 0:
+                    report[col] = f"Clipped {outliers_count} outliers via IQR fences"
 
-  # 4. Convert impossible domain values to NaN BEFORE imputation
-  for col in df.select_dtypes(include=[np.number]).columns:
-    col_l = col.lower()
-    invalid_mask = pd.Series(False, index=df.index)
-    if any(k in col_l for k in ['price', 'area', 'sqft', 'distance', 'salary']):
-      invalid_mask = df[col] <= 0
-    elif any(k in col_l for k in ['bedroom', 'bathroom', 'room', 'count']):
-      invalid_mask = df[col] < 0
-    elif 'year' in col_l:
-      invalid_mask = (df[col] < 1800) | (df[col] > current_year)
-
-    invalid_count = int(invalid_mask.sum())
-    if invalid_count > 0:
-      df.loc[invalid_mask, col] = np.nan
-      audit_report.append(
-          f"Flagged {invalid_count} invalid domain values as NaN in '{col}'."
-      )
-
-  # 5. Impute missing values (Median for numeric, Mode for categorical)
-  for col in df.columns:
-    null_count = int(df[col].isnull().sum())
-    if null_count > 0:
-      if pd.api.types.is_numeric_dtype(df[col]):
-        med_val = df[col].median()
-        df[col] = df[col].fillna(med_val)
-        audit_report.append(
-            f"Imputed {null_count} missing values in '{col}' with median"
-            f' ({med_val:.2f}).'
-        )
-      else:
-        mode_val = df[col].mode()[0]
-        df[col] = df[col].fillna(mode_val)
-        audit_report.append(
-            f"Imputed {null_count} missing values in '{col}' with mode"
-            f" ('{mode_val}')."
-        )
-
-  # 6. IQR outlier clipping with domain floor/ceiling guards
-  for col in df.select_dtypes(include=[np.number]).columns:
-    if col.lower().endswith('_id') or col.lower() == 'id':
-      continue
-    q1, q3 = df[col].quantile(0.25), df[col].quantile(0.75)
-    iqr = q3 - q1
-    if iqr > 0:
-      lower = q1 - 1.5 * iqr
-      upper = q3 + 1.5 * iqr
-      col_l = col.lower()
-
-      if any(k in col_l for k in ['price', 'area', 'sqft', 'distance']):
-        lower = max(lower, df[col].min())
-      if 'bedroom' in col_l or 'bathroom' in col_l:
-        lower = max(lower, 1)
-      if 'year' in col_l:
-        upper = min(upper, current_year)
-
-      outliers = int(((df[col] < lower) | (df[col] > upper)).sum())
-      if outliers > 0:
-        df[col] = df[col].clip(lower=lower, upper=upper)
-        audit_report.append(
-            f"Clipped {outliers} IQR outliers in '{col}' to range"
-            f' [{lower:.2f}, {upper:.2f}].'
-        )
-
-  # 7. Round discrete integer columns cleanly
-  for col in df.select_dtypes(include=[np.number]).columns:
-    if any(k in col.lower() for k in ['bedroom', 'bathroom', 'year', 'count']):
-      df[col] = df[col].round().astype('int64')
-      audit_report.append(f"Rounded '{col}' to integer values.")
-
-  return df, audit_report
+    return df, report
 
 # ----------------- Sidebar File Ingestion ----------------- #
 
