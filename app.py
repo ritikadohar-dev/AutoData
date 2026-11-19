@@ -69,18 +69,29 @@ def convert_df_to_csv(df):
 
 def auto_clean_dataframe(
     df: pd.DataFrame, current_year: int = 2026
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, list[str]]:
   df = df.copy()
+  audit_report = []
 
   # 1. Remove exact duplicates
-  df = df.drop_duplicates().reset_index(drop=True)
+  dup_count = int(df.duplicated().sum())
+  if dup_count > 0:
+    df = df.drop_duplicates().reset_index(drop=True)
+    audit_report.append(f'Removed {dup_count} exact duplicate rows.')
 
   # 2. Convert placeholder symbols to NaN & trim whitespace
   placeholders = {'?', 'NA', 'N/A', 'null', 'None', 'nan', '-', ''}
   for col in df.select_dtypes(include=['object', 'string']).columns:
+    before_nulls = df[col].isnull().sum()
     df[col] = df[col].apply(
         lambda x: np.nan if (isinstance(x, str) and x.strip() in placeholders) else x
     )
+    replaced = int(df[col].isnull().sum() - before_nulls)
+    if replaced > 0:
+      audit_report.append(
+          f"Converted {replaced} placeholder symbols to NaN in '{col}'."
+      )
+
     if not col.lower().endswith('_id') and col.lower() != 'id':
       df[col] = df[col].apply(lambda x: x.strip() if isinstance(x, str) else x)
 
@@ -105,28 +116,53 @@ def auto_clean_dataframe(
       df[col] = df[col].apply(
           lambda x: bool_map[str(x).lower()] if pd.notna(x) else x
       )
+      audit_report.append(
+          f"Standardized boolean values to 'Yes'/'No' in '{col}'."
+      )
     else:
       df[col] = df[col].apply(
           lambda x: aliases.get(x.lower(), x.title()) if isinstance(x, str) else x
+      )
+      audit_report.append(
+          f"Standardized text casing and aliases in '{col}'."
       )
 
   # 4. Convert impossible domain values to NaN BEFORE imputation
   for col in df.select_dtypes(include=[np.number]).columns:
     col_l = col.lower()
+    invalid_mask = pd.Series(False, index=df.index)
     if any(k in col_l for k in ['price', 'area', 'sqft', 'distance', 'salary']):
-      df.loc[df[col] <= 0, col] = np.nan
+      invalid_mask = df[col] <= 0
     elif any(k in col_l for k in ['bedroom', 'bathroom', 'room', 'count']):
-      df.loc[df[col] < 0, col] = np.nan
+      invalid_mask = df[col] < 0
     elif 'year' in col_l:
-      df.loc[(df[col] < 1800) | (df[col] > current_year), col] = np.nan
+      invalid_mask = (df[col] < 1800) | (df[col] > current_year)
+
+    invalid_count = int(invalid_mask.sum())
+    if invalid_count > 0:
+      df.loc[invalid_mask, col] = np.nan
+      audit_report.append(
+          f"Flagged {invalid_count} invalid domain values as NaN in '{col}'."
+      )
 
   # 5. Impute missing values (Median for numeric, Mode for categorical)
   for col in df.columns:
-    if df[col].isnull().sum() > 0:
+    null_count = int(df[col].isnull().sum())
+    if null_count > 0:
       if pd.api.types.is_numeric_dtype(df[col]):
-        df[col] = df[col].fillna(df[col].median())
+        med_val = df[col].median()
+        df[col] = df[col].fillna(med_val)
+        audit_report.append(
+            f"Imputed {null_count} missing values in '{col}' with median"
+            f' ({med_val:.2f}).'
+        )
       else:
-        df[col] = df[col].fillna(df[col].mode()[0])
+        mode_val = df[col].mode()[0]
+        df[col] = df[col].fillna(mode_val)
+        audit_report.append(
+            f"Imputed {null_count} missing values in '{col}' with mode"
+            f" ('{mode_val}')."
+        )
 
   # 6. IQR outlier clipping with domain floor/ceiling guards
   for col in df.select_dtypes(include=[np.number]).columns:
@@ -146,14 +182,21 @@ def auto_clean_dataframe(
       if 'year' in col_l:
         upper = min(upper, current_year)
 
-      df[col] = df[col].clip(lower=lower, upper=upper)
+      outliers = int(((df[col] < lower) | (df[col] > upper)).sum())
+      if outliers > 0:
+        df[col] = df[col].clip(lower=lower, upper=upper)
+        audit_report.append(
+            f"Clipped {outliers} IQR outliers in '{col}' to range"
+            f' [{lower:.2f}, {upper:.2f}].'
+        )
 
   # 7. Round discrete integer columns cleanly
   for col in df.select_dtypes(include=[np.number]).columns:
     if any(k in col.lower() for k in ['bedroom', 'bathroom', 'year', 'count']):
       df[col] = df[col].round().astype('int64')
+      audit_report.append(f"Rounded '{col}' to integer values.")
 
-  return df
+  return df, audit_report
 
 # ----------------- Sidebar File Ingestion ----------------- #
 
